@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KOTC Leaderboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👑</text></svg>">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #14171c; --muted: #6b7280; --line: #e5e7eb;
+    --gold: #b7791f; --gold-bg: #fdf6e3; --live: #dc2626; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e1116; --card: #161b22; --text: #e6e8eb; --muted: #8b949e; --line: #2a313c;
+            --gold: #e3b341; --gold-bg: #2a2410; --live: #f85149; --accent: #58a6ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: .85rem; margin-bottom: 16px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+  .controls label { display: flex; gap: 6px; align-items: center; font-size: .9rem; }
+  input[type=date], button { font: inherit; padding: 6px 10px; border: 1px solid var(--line);
+         border-radius: 8px; background: var(--card); color: var(--text); }
+  button { cursor: pointer; }
+  .king { background: var(--gold-bg); border: 1px solid var(--gold); border-radius: 12px;
+          padding: 14px 16px; margin-bottom: 16px; font-size: 1.1rem; }
+  .king b { color: var(--gold); }
+  .games { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 16px; }
+  .game { flex: 0 0 auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 8px 10px; font-size: .8rem; min-width: 118px; }
+  .game .row { display: flex; justify-content: space-between; gap: 10px; }
+  .game .st { color: var(--muted); margin-top: 3px; }
+  .game.in .st { color: var(--live); font-weight: 600; }
+  .wrap { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+       position: sticky; top: 0; background: var(--card); }
+  th:nth-child(-n+3), td:nth-child(-n+3) { text-align: left; }
+  td.rank { color: var(--muted); width: 1%; }
+  td.pra { font-weight: 700; }
+  td.status { color: var(--muted); font-size: .8rem; }
+  td.status.in { color: var(--live); font-weight: 600; }
+  tr.top td { background: var(--gold-bg); }
+  tr.top td.pra { color: var(--gold); }
+  .team { display: inline-flex; align-items: center; gap: 6px; }
+  .team img { width: 20px; height: 20px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--live);
+         margin-right: 5px; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .empty { padding: 32px; text-align: center; color: var(--muted); }
+  .foot { color: var(--muted); font-size: .8rem; margin-top: 12px; }
+  @media (max-width: 560px) { .hide-sm { display: none; } th, td { padding: 7px 6px; } td:nth-child(2) { white-space: normal; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>King of the Court 👑</h1>
+  <div class="sub">Highest points + rebounds + assists in a single NBA day. <span id="updated"></span></div>
+
+  <div class="controls">
+    <label>Date <input type="date" id="date"></label>
+    <button id="today">Today</button>
+    <label><input type="checkbox" id="contenders"> Hide non-contenders</label>
+  </div>
+
+  <div id="king"></div>
+  <div class="games" id="games"></div>
+  <div class="wrap"><div id="board" class="empty">Loading…</div></div>
+  <div class="foot">Data from ESPN. Refreshes every 30s while games are live. Players need at least 1 point, rebound or assist to be listed.
+    "Non-contenders" are players whose game is over and who finished below the leader.</div>
+</main>
+
+<script>
+const API = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+const $ = id => document.getElementById(id);
+let timer = null, loadId = 0;
+
+// The NBA day is defined by US Eastern time.
+function todayET() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
+}
+
+function readHash() {
+  const m = location.hash.match(/\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : todayET();
+}
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(r.status + " " + url);
+  return r.json();
+}
+
+async function load(date) {
+  clearTimeout(timer);
+  const id = ++loadId;
+  const sb = await getJSON(`${API}/scoreboard?dates=${date.replaceAll("-", "")}`);
+  const events = sb.events || [];
+
+  const games = events.map(e => {
+    const c = e.competitions[0];
+    const t = Object.fromEntries(c.competitors.map(x => [x.homeAway, x]));
+    return { id: e.id, state: e.status.type.state, detail: e.status.type.shortDetail, away: t.away, home: t.home };
+  });
+
+  const started = games.filter(g => g.state !== "pre");
+  const summaries = await Promise.all(started.map(g =>
+    getJSON(`${API}/summary?event=${g.id}`).catch(() => null)));
+
+  const players = [];
+  summaries.forEach((s, i) => {
+    if (!s?.boxscore?.players) return;
+    const g = started[i];
+    for (const team of s.boxscore.players) {
+      const st = team.statistics?.[0];
+      if (!st) continue;
+      const k = name => st.keys.indexOf(name);
+      const [iP, iR, iA, iM] = [k("points"), k("rebounds"), k("assists"), k("minutes")];
+      for (const a of st.athletes) {
+        if (a.didNotPlay || !a.stats?.length) continue;
+        const pts = +a.stats[iP] || 0, reb = +a.stats[iR] || 0, ast = +a.stats[iA] || 0;
+        const pra = pts + reb + ast;
+        if (pra < 1) continue;
+        players.push({
+          name: a.athlete.displayName, team: team.team.shortDisplayName, logo: team.team.logo,
+          min: a.stats[iM], pts, reb, ast, pra, state: g.state, detail: g.detail,
+        });
+      }
+    }
+  });
+  players.sort((a, b) => b.pra - a.pra || b.pts - a.pts);
+  if (id !== loadId) return; // a newer load started; drop this result
+
+  render(date, games, players);
+
+  // Poll fast while anything is live, slowly if games are still to come today, otherwise stop.
+  const live = games.some(g => g.state === "in");
+  const pending = games.some(g => g.state === "pre");
+  if (live) timer = setTimeout(() => load(date), 30_000);
+  else if (pending && date === todayET()) timer = setTimeout(() => load(date), 5 * 60_000);
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+
+function render(date, games, players) {
+  $("updated").textContent = "Last update: " + new Date().toLocaleTimeString();
+
+  $("games").innerHTML = games.map(g => `
+    <div class="game ${g.state}">
+      <div class="row"><span>${esc(g.away.team.abbreviation)}</span><span>${g.state === "pre" ? "" : esc(g.away.score)}</span></div>
+      <div class="row"><span>${esc(g.home.team.abbreviation)}</span><span>${g.state === "pre" ? "" : esc(g.home.score)}</span></div>
+      <div class="st">${g.state === "in" ? '<span class="dot"></span>' : ""}${esc(g.detail)}</div>
+    </div>`).join("");
+
+  if (!games.length) {
+    $("king").innerHTML = "";
+    $("board").className = "empty";
+    $("board").textContent = "No NBA games on this date.";
+    return;
+  }
+  if (!players.length) {
+    $("king").innerHTML = "";
+    $("board").className = "empty";
+    $("board").textContent = "No games have tipped off yet.";
+    return;
+  }
+
+  const top = players[0].pra;
+  const kings = players.filter(p => p.pra === top);
+  const allFinal = games.every(g => g.state === "post");
+  $("king").innerHTML = `<div class="king">${allFinal ? "The king is" : "Current leader:"}
+    <b>${kings.map(p => esc(p.name)).join(" & ")}</b> with <b>${top}</b> PRA</div>`;
+
+  const hide = $("contenders").checked;
+  const shown = hide ? players.filter(p => p.state !== "post" || p.pra === top) : players;
+
+  let rank = 0, prev = null;
+  $("board").className = "";
+  $("board").innerHTML = `<table>
+    <thead><tr><th>#</th><th>Player</th><th>Team</th><th class="hide-sm">Min</th>
+      <th>Pts</th><th>Reb</th><th>Ast</th><th>PRA</th><th class="hide-sm">Status</th></tr></thead>
+    <tbody>${shown.map((p, i) => {
+      if (p.pra !== prev) { rank = i + 1; prev = p.pra; }
+      const crown = p.pra === top ? " 👑" : "";
+      return `<tr class="${p.pra === top ? "top" : ""}">
+        <td class="rank">${rank}</td>
+        <td>${esc(p.name)}${crown}</td>
+        <td><span class="team"><img src="${esc(p.logo)}" alt="${esc(p.team)}" title="${esc(p.team)}" loading="lazy"><span class="hide-sm">${esc(p.team)}</span></span></td>
+        <td class="hide-sm">${esc(p.min ?? "")}</td>
+        <td>${p.pts}</td><td>${p.reb}</td><td>${p.ast}</td>
+        <td class="pra">${p.pra}</td>
+        <td class="status ${p.state} hide-sm">${p.state === "in" ? '<span class="dot"></span>' : ""}${esc(p.detail)}</td>
+      </tr>`;
+    }).join("")}</tbody></table>`;
+}
+
+function go(date) {
+  $("date").value = date;
+  history.replaceState(null, "", date === todayET() ? location.pathname : "#" + date);
+  $("board").className = "empty";
+  $("board").textContent = "Loading…";
+  load(date).catch(err => {
+    if (date !== $("date").value) return;
+    $("board").className = "empty";
+    $("board").textContent = "Couldn't load data: " + err.message;
+    timer = setTimeout(() => go(date), 60_000);
+  });
+}
+
+$("date").addEventListener("change", e => e.target.value && go(e.target.value));
+$("today").addEventListener("click", () => go(todayET()));
+$("contenders").addEventListener("change", () => go($("date").value));
+window.addEventListener("hashchange", () => go(readHash()));
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && $("date").value === todayET()) go(todayET());
+});
+go(readHash());
+</script>
+</body>
+</html>

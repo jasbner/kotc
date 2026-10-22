@@ -77,7 +77,16 @@
 <script>
 const API = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
 const $ = id => document.getElementById(id);
-let timer = null, loadId = 0;
+let timer = null, loadId = 0, paused = false, lastLoadAt = 0, refreshError = null;
+let followToday = true; // roll over to the new day automatically unless a past date was picked
+let last = null;        // most recent { date, games, players }, so toggles re-render without refetching
+// Per-game box score cache: event id -> { players, sig, fetchedAt, endedAt, settled }.
+// Live games are re-fetched only when their score or clock moves (sig), which skips timeouts,
+// reviews and halftime. Finished games are re-fetched every few minutes for their first hour,
+// since box scores can lag the "Final" status and stats get corrected after the buzzer; after
+// that (or once the game started long enough ago) they're kept for good.
+const cache = new Map();
+const LIVE_POLL_MS = 30_000, FINAL_REFETCH_MS = 5 * 60_000, SETTLE_MS = 60 * 60_000, LONG_AGO_MS = 4 * 60 * 60_000;
 
 // The NBA day is defined by US Eastern time.
 function todayET() {
@@ -95,59 +104,127 @@ async function getJSON(url) {
   return r.json();
 }
 
+function parsePlayers(summary) {
+  const players = [];
+  for (const team of summary?.boxscore?.players || []) {
+    const st = team.statistics?.[0];
+    if (!st) continue;
+    const k = name => st.keys.indexOf(name);
+    const [iP, iR, iA, iM] = [k("points"), k("rebounds"), k("assists"), k("minutes")];
+    for (const a of st.athletes) {
+      if (a.didNotPlay || !a.stats?.length) continue;
+      const pts = +a.stats[iP] || 0, reb = +a.stats[iR] || 0, ast = +a.stats[iA] || 0;
+      const pra = pts + reb + ast;
+      if (pra < 1) continue;
+      players.push({
+        name: a.athlete.displayName, team: team.team.shortDisplayName, logo: team.team.logo,
+        min: a.stats[iM], pts, reb, ast, pra,
+      });
+    }
+  }
+  return players;
+}
+
 async function load(date) {
   clearTimeout(timer);
   const id = ++loadId;
-  const sb = await getJSON(`${API}/scoreboard?dates=${date.replaceAll("-", "")}`);
-  const events = sb.events || [];
+  try {
+    const sb = await getJSON(`${API}/scoreboard?dates=${date.replaceAll("-", "")}`);
+    const games = (sb.events || []).map(e => {
+      const c = e.competitions[0];
+      const t = Object.fromEntries(c.competitors.map(x => [x.homeAway, x]));
+      return { id: e.id, state: e.status.type.state, completed: e.status.type.completed,
+               detail: e.status.type.shortDetail, away: t.away, home: t.home,
+               start: Date.parse(e.date), settled: false };
+    });
 
-  const games = events.map(e => {
-    const c = e.competitions[0];
-    const t = Object.fromEntries(c.competitors.map(x => [x.homeAway, x]));
-    return { id: e.id, state: e.status.type.state, detail: e.status.type.shortDetail, away: t.away, home: t.home };
-  });
+    const now = Date.now();
+    const lists = await Promise.all(games.map(g => gamePlayers(g, now)));
+    const players = lists.flat().sort((a, b) => b.pra - a.pra || b.pts - a.pts);
+    if (id !== loadId) return; // a newer load started; drop this result
 
-  const started = games.filter(g => g.state !== "pre");
-  const summaries = await Promise.all(started.map(g =>
-    getJSON(`${API}/summary?event=${g.id}`).catch(() => null)));
+    last = { date, games, players };
+    lastLoadAt = now;
+    refreshError = null;
+    render(date, games, players);
 
-  const players = [];
-  summaries.forEach((s, i) => {
-    if (!s?.boxscore?.players) return;
-    const g = started[i];
-    for (const team of s.boxscore.players) {
-      const st = team.statistics?.[0];
-      if (!st) continue;
-      const k = name => st.keys.indexOf(name);
-      const [iP, iR, iA, iM] = [k("points"), k("rebounds"), k("assists"), k("minutes")];
-      for (const a of st.athletes) {
-        if (a.didNotPlay || !a.stats?.length) continue;
-        const pts = +a.stats[iP] || 0, reb = +a.stats[iR] || 0, ast = +a.stats[iA] || 0;
-        const pra = pts + reb + ast;
-        if (pra < 1) continue;
-        players.push({
-          name: a.athlete.displayName, team: team.team.shortDisplayName, logo: team.team.logo,
-          min: a.stats[iM], pts, reb, ast, pra, state: g.state, detail: g.detail,
-        });
-      }
+    // Poll fast while anything is live, every few minutes while finished games settle or games
+    // are still to come today. When following today and everything is settled, check
+    // occasionally so the page rolls over to the next day.
+    const live = games.some(g => g.state === "in");
+    const pending = games.some(g => g.state === "pre");
+    const unsettled = games.some(g => !g.settled && g.state === "post");
+    if (live) schedule(LIVE_POLL_MS);
+    else if (unsettled || (pending && date === todayET())) schedule(FINAL_REFETCH_MS);
+    else if (followToday) schedule(10 * 60_000);
+  } catch (err) {
+    if (id === loadId) showError(err, date);
+  }
+}
+
+// Returns a game's players, downloading its box score only when the cache entry is out of date.
+// Sets g.settled once a finished game's stats are final enough to crown a king.
+async function gamePlayers(g, now) {
+  if (g.state === "pre") return [];
+  if (g.state === "post" && !g.completed) { g.settled = true; return []; } // postponed or canceled
+
+  const final = g.state === "post";
+  const sig = `${g.away.score}-${g.home.score}-${g.detail}`;
+  let entry = cache.get(g.id);
+  const upToDate = entry && (final
+    ? entry.endedAt !== undefined && (entry.settled || now - entry.fetchedAt < FINAL_REFETCH_MS)
+    : entry.sig === sig);
+
+  if (!upToDate) {
+    const summary = await getJSON(`${API}/summary?event=${g.id}`).catch(() => null);
+    if (summary) {
+      // endedAt is when this tab first got a box score for the game as final.
+      const endedAt = final ? (entry?.endedAt ?? now) : undefined;
+      entry = { players: parsePlayers(summary), sig, fetchedAt: now, endedAt, settled: false };
+      cache.set(g.id, entry);
     }
-  });
-  players.sort((a, b) => b.pra - a.pra || b.pts - a.pts);
-  if (id !== loadId) return; // a newer load started; drop this result
+  }
 
-  render(date, games, players);
+  // An empty box score never settles, so a bad response gets retried instead of kept for good.
+  if (final && entry?.endedAt !== undefined && !entry.settled && entry.players.length &&
+      (now - entry.endedAt >= SETTLE_MS || now - g.start >= LONG_AGO_MS)) entry.settled = true;
+  g.settled = !!(final && entry?.settled);
 
-  // Poll fast while anything is live, slowly if games are still to come today, otherwise stop.
-  const live = games.some(g => g.state === "in");
-  const pending = games.some(g => g.state === "pre");
-  if (live) timer = setTimeout(() => load(date), 30_000);
-  else if (pending && date === todayET()) timer = setTimeout(() => load(date), 5 * 60_000);
+  // Status comes from the scoreboard, so it stays current even if the box score fetch failed.
+  return (entry?.players || []).map(p => ({ ...p, state: g.state, detail: g.detail }));
+}
+
+// Timers don't fetch while the tab is hidden; the visibilitychange handler catches up instead.
+function schedule(ms) {
+  timer = setTimeout(() => { if (document.hidden) paused = true; else tick(); }, ms);
+}
+
+function tick() {
+  const date = $("date").value;
+  // Hold the rollover until the previous night's games are over and their stats have settled.
+  const busy = last?.date === date && last.games.some(g => g.state === "in" || (g.state === "post" && !g.settled));
+  if (followToday && date !== todayET() && !busy) go(todayET());
+  else load(date);
+}
+
+function showError(err, date) {
+  if (date !== $("date").value) return;
+  if (last?.date === date) {
+    // Keep the last good leaderboard on screen and flag it as stale.
+    refreshError = err.message;
+    render(last.date, last.games, last.players);
+  } else {
+    $("board").className = "empty";
+    $("board").textContent = "Couldn't load data: " + err.message;
+  }
+  schedule(60_000);
 }
 
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 
 function render(date, games, players) {
-  $("updated").textContent = "Last update: " + new Date().toLocaleTimeString();
+  $("updated").textContent = "Last update: " + new Date(lastLoadAt).toLocaleTimeString() +
+    (refreshError ? ` (couldn't refresh: ${refreshError}; retrying)` : "");
 
   $("games").innerHTML = games.map(g => `
     <div class="game ${g.state}">
@@ -165,13 +242,16 @@ function render(date, games, players) {
   if (!players.length) {
     $("king").innerHTML = "";
     $("board").className = "empty";
-    $("board").textContent = "No games have tipped off yet.";
+    $("board").textContent = games.some(g => g.state !== "pre")
+      ? "Box scores aren't available yet. Retrying shortly."
+      : "No games have tipped off yet.";
     return;
   }
 
   const top = players[0].pra;
   const kings = players.filter(p => p.pra === top);
-  const allFinal = games.every(g => g.state === "post");
+  // Only crown a king once every game is final and its stats have had time to settle.
+  const allFinal = games.every(g => g.state === "post" && g.settled);
   $("king").innerHTML = `<div class="king">${allFinal ? "The king is" : "Current leader:"}
     <b>${kings.map(p => esc(p.name)).join(" & ")}</b> with <b>${top}</b> PRA</div>`;
 
@@ -199,24 +279,27 @@ function render(date, games, players) {
 }
 
 function go(date) {
+  clearTimeout(timer);
+  followToday = date === todayET();
   $("date").value = date;
-  history.replaceState(null, "", date === todayET() ? location.pathname : "#" + date);
+  history.replaceState(null, "", followToday ? location.pathname : "#" + date);
   $("board").className = "empty";
   $("board").textContent = "Loading…";
-  load(date).catch(err => {
-    if (date !== $("date").value) return;
-    $("board").className = "empty";
-    $("board").textContent = "Couldn't load data: " + err.message;
-    timer = setTimeout(() => go(date), 60_000);
-  });
+  load(date);
 }
 
 $("date").addEventListener("change", e => e.target.value && go(e.target.value));
 $("today").addEventListener("click", () => go(todayET()));
-$("contenders").addEventListener("change", () => go($("date").value));
+$("contenders").addEventListener("change", () => last && render(last.date, last.games, last.players));
 window.addEventListener("hashchange", () => go(readHash()));
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && $("date").value === todayET()) go(todayET());
+  if (document.hidden) return;
+  // Catch up after a skipped poll, or after the phone froze timers while we were following today.
+  if (paused || (followToday && Date.now() - lastLoadAt >= LIVE_POLL_MS)) {
+    paused = false;
+    clearTimeout(timer);
+    tick();
+  }
 });
 go(readHash());
 </script>

@@ -15,6 +15,7 @@
             --gold: #e3b341; --gold-bg: #2a2410; --live: #f85149; --accent: #58a6ff; }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   main { max-width: 900px; margin: 0 auto; padding: 20px 16px 48px; }
@@ -51,6 +52,14 @@
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--live);
          margin-right: 5px; animation: pulse 1.4s infinite; }
   @keyframes pulse { 50% { opacity: .25; } }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none;
+         color: var(--muted); padding: 8px 12px; margin-bottom: -1px; }
+  .tabs button[aria-selected=true] { color: var(--text); border-bottom-color: var(--gold); font-weight: 600; }
+  button.game { font: inherit; font-size: .8rem; text-align: left; cursor: pointer; }
+  .game.out { opacity: .4; text-decoration: line-through; }
+  .tag { font-size: .7rem; font-weight: 600; color: var(--accent); border: 1px solid currentColor;
+         border-radius: 4px; padding: 0 4px; margin-left: 4px; vertical-align: 1px; }
   .empty { padding: 32px; text-align: center; color: var(--muted); }
   .foot { color: var(--muted); font-size: .8rem; margin-top: 12px; }
   @media (max-width: 560px) { .hide-sm { display: none; } th, td { padding: 7px 6px; } td:nth-child(2) { white-space: normal; } }
@@ -58,44 +67,51 @@
 </head>
 <body>
 <main>
-  <h1>King of the Court 👑</h1>
-  <div class="sub">Highest points + rebounds + assists in a single NBA day. <span id="updated"></span></div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-mode="nba">King of the Court</button>
+    <button role="tab" data-mode="nfl">King of the End Zone</button>
+  </nav>
+  <h1 id="title"></h1>
+  <div class="sub"><span id="blurb"></span> <span id="updated"></span></div>
 
   <div class="controls">
     <label>Date <input type="date" id="date"></label>
     <button id="today">Today</button>
-    <label><input type="checkbox" id="contenders"> Hide non-contenders</label>
+    <label id="contenders-label"><input type="checkbox" id="contenders"> Hide non-contenders</label>
   </div>
 
   <div id="king"></div>
   <div class="games" id="games"></div>
   <div class="wrap"><div id="board" class="empty">Loading…</div></div>
-  <div class="foot">Data from ESPN. Refreshes every 30s while games are live. Players need at least 1 point, rebound or assist to be listed.
-    "Non-contenders" are players whose game is over and who finished below the leader.</div>
+  <div class="foot" id="foot"></div>
 </main>
 
 <script>
-const API = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+const ESPN = "https://site.api.espn.com/apis/site/v2/sports";
 const $ = id => document.getElementById(id);
 let timer = null, loadId = 0, paused = false, lastLoadAt = 0, refreshError = null;
 let followToday = true; // roll over to the new day automatically unless a past date was picked
 let last = null;        // most recent { date, games, players }, so toggles re-render without refetching
+let mode = "nba";       // which promo tab is showing; a key of MODES
+let shownDate = null;   // date go() last switched to (the date input already holds a picked date before go runs)
+const excluded = new Set(); // NFL game ids the user dropped from the slate (reset when the date changes)
 // Per-game box score cache: event id -> { players, sig, fetchedAt, endedAt, settled }.
 // Live games are re-fetched only when their score or clock moves (sig), which skips timeouts,
 // reviews and halftime. Finished games are re-fetched every few minutes for their first hour,
 // since box scores can lag the "Final" status and stats get corrected after the buzzer; after
-// that (or once the game started long enough ago) they're kept for good.
+// that (or once the game started long enough ago, per sport) they're kept for good.
 const cache = new Map();
-const LIVE_POLL_MS = 30_000, FINAL_REFETCH_MS = 5 * 60_000, SETTLE_MS = 60 * 60_000, LONG_AGO_MS = 4 * 60 * 60_000;
+const LIVE_POLL_MS = 30_000, FINAL_REFETCH_MS = 5 * 60_000, SETTLE_MS = 60 * 60_000;
 
 // The NBA day is defined by US Eastern time.
 function todayET() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
 }
 
+// #2026-10-26 is the NBA board for that date; #nfl and #nfl/2026-10-26 are the NFL board.
 function readHash() {
   const m = location.hash.match(/\d{4}-\d{2}-\d{2}/);
-  return m ? m[0] : todayET();
+  return { mode: location.hash.startsWith("#nfl") ? "nfl" : "nba", date: m ? m[0] : todayET() };
 }
 
 async function getJSON(url) {
@@ -125,11 +141,77 @@ function parsePlayers(summary) {
   return players;
 }
 
+// A Qualifying Bet can be any TD scorer, so every non-passing touchdown counts: for a passing TD
+// the receiver is the scorer. Return and defensive TDs are flagged D/ST, since bets on the
+// player and on that team's D/ST both win when one of those is the longest.
+function parseTDs(summary) {
+  const tds = [];
+  for (const p of summary?.scoringPlays || []) {
+    const kind = p.type?.text || "";
+    if (p.type?.abbreviation !== "TD" && !/touchdown/i.test(kind)) continue;
+    const text = (p.text || "").trim();
+    // "Name 45 Yd pass from…", or with no yardage e.g. "Name Fumble Recovery in End Zone".
+    const m = text.match(/^(.+?)\s+(?:(\d+)\s*Y(?:ar)?ds?\b|(?:fumble|interception|blocked|kickoff|punt|return|recovery)\b)/i);
+    const per = p.period?.number;
+    tds.push({
+      name: m ? m[1] : text.split(" (")[0], yds: +(m?.[2] ?? 0), text,
+      team: p.team?.abbreviation || "", logo: p.team?.logo || "",
+      play: /^passing/i.test(kind) ? "Rec" : /^rushing/i.test(kind) ? "Rush" : kind.replace(/\s*touchdown$/i, ""),
+      dst: !/^(passing|rushing)/i.test(kind) && !/\bown\b/i.test(kind), // "(Own)" = offense recovered its own fumble
+      when: (per > 4 ? "OT" : "Q" + per) + " " + (p.clock?.displayValue || ""),
+    });
+  }
+  return tds;
+}
+
+const teamCell = p => `<td><span class="team"><img src="${esc(p.logo)}" alt="${esc(p.team)}" title="${esc(p.team)}" loading="lazy"><span class="hide-sm">${esc(p.team)}</span></span></td>`;
+const statusCell = p => `<td class="status ${p.state} hide-sm">${p.state === "in" ? '<span class="dot"></span>' : ""}${esc(p.detail)}</td>`;
+
+const MODES = {
+  nba: {
+    api: `${ESPN}/basketball/nba`, title: "King of the Court 👑", doc: "KOTC Leaderboard",
+    blurb: "Highest points + rebounds + assists in a single NBA day.",
+    foot: `Data from ESPN. Refreshes every 30s while games are live. Players need at least 1 point, rebound or assist to be listed.
+      "Non-contenders" are players whose game is over and who finished below the leader.`,
+    parse: s => parsePlayers(s).map(p => ({ ...p, value: p.pra, tiebreak: p.pts })),
+    sig: g => `${g.away.score}-${g.home.score}-${g.detail}`,
+    longAgo: 4 * 60 * 60_000, emptyFinal: false,
+    none: "No NBA games on this date.", pre: "No games have tipped off yet.",
+    empty: "Box scores aren't available yet. Retrying shortly.",
+    king: (names, top) => `<b>${names}</b> with <b>${top}</b> PRA`,
+    head: `<th>#</th><th>Player</th><th>Team</th><th class="hide-sm">Min</th>
+      <th>Pts</th><th>Reb</th><th>Ast</th><th>PRA</th><th class="hide-sm">Status</th>`,
+    cells: (p, crown) => `<td>${esc(p.name)}${crown}</td>${teamCell(p)}
+      <td class="hide-sm">${esc(p.min ?? "")}</td>
+      <td>${p.pts}</td><td>${p.reb}</td><td>${p.ast}</td>
+      <td class="pra">${p.pra}</td>${statusCell(p)}`,
+  },
+  nfl: {
+    api: `${ESPN}/football/nfl`, title: "King of the End Zone 🏈", doc: "KOTEZ Leaderboard",
+    blurb: "Longest touchdown on the NFL slate. Tap a game to take it off the slate.",
+    foot: `Data from ESPN. Refreshes every 30s while games are live. Passing TDs count for the receiver, not the passer.
+      Return and defensive TDs are tagged D/ST: bets on the player or that team's D/ST both win. Ties split the pool.`,
+    parse: s => parseTDs(s).map(p => ({ ...p, value: p.yds, tiebreak: 0 })),
+    // Scoring plays only change when the score does, so the running clock doesn't trigger a refetch.
+    sig: g => `${g.away.score}-${g.home.score}`,
+    // NFL games run 3-4 hours, and a finished game can legitimately have no touchdowns.
+    longAgo: 5 * 60 * 60_000, emptyFinal: true,
+    none: "No NFL games on this date.", pre: "No games have kicked off yet.",
+    empty: "No touchdowns yet. If none are scored, No Touchdown Scorer bets split the pool.",
+    king: (names, top) => `<b>${names}</b> with a <b>${top}</b>-yard TD`,
+    head: `<th>#</th><th>Player</th><th>Team</th><th>Yds</th><th>Play</th>
+      <th class="hide-sm">When</th><th class="hide-sm">Status</th>`,
+    cells: (p, crown) => `<td title="${esc(p.text)}">${esc(p.name)}${p.dst ? '<span class="tag">D/ST</span>' : ""}${crown}</td>${teamCell(p)}
+      <td class="pra">${p.yds}</td><td>${esc(p.play)}</td>
+      <td class="hide-sm">${esc(p.when)}</td>${statusCell(p)}`,
+  },
+};
+
 async function load(date) {
   clearTimeout(timer);
   const id = ++loadId;
   try {
-    const sb = await getJSON(`${API}/scoreboard?dates=${date.replaceAll("-", "")}`);
+    const sb = await getJSON(`${MODES[mode].api}/scoreboard?dates=${date.replaceAll("-", "")}`);
     const games = (sb.events || []).map(e => {
       const c = e.competitions[0];
       const t = Object.fromEntries(c.competitors.map(x => [x.homeAway, x]));
@@ -139,8 +221,8 @@ async function load(date) {
     });
 
     const now = Date.now();
-    const lists = await Promise.all(games.map(g => gamePlayers(g, now)));
-    const players = lists.flat().sort((a, b) => b.pra - a.pra || b.pts - a.pts);
+    const lists = await Promise.all(games.map(g => excluded.has(g.id) ? [] : gamePlayers(g, now)));
+    const players = lists.flat().sort((a, b) => b.value - a.value || b.tiebreak - a.tiebreak);
     if (id !== loadId) return; // a newer load started; drop this result
 
     last = { date, games, players };
@@ -151,9 +233,10 @@ async function load(date) {
     // Poll fast while anything is live, every few minutes while finished games settle or games
     // are still to come today. When following today and everything is settled, check
     // occasionally so the page rolls over to the next day.
-    const live = games.some(g => g.state === "in");
-    const pending = games.some(g => g.state === "pre");
-    const unsettled = games.some(g => !g.settled && g.state === "post");
+    const slate = games.filter(g => !excluded.has(g.id));
+    const live = slate.some(g => g.state === "in");
+    const pending = slate.some(g => g.state === "pre");
+    const unsettled = slate.some(g => !g.settled && g.state === "post");
     if (live) schedule(LIVE_POLL_MS);
     else if (unsettled || (pending && date === todayET())) schedule(FINAL_REFETCH_MS);
     else if (followToday) schedule(10 * 60_000);
@@ -169,29 +252,33 @@ async function gamePlayers(g, now) {
   if (g.state === "post" && !g.completed) { g.settled = true; return []; } // postponed or canceled
 
   const final = g.state === "post";
-  const sig = `${g.away.score}-${g.home.score}-${g.detail}`;
-  let entry = cache.get(g.id);
+  const m = mode; // pinned, in case the tab switches while the box score is downloading
+  const M = MODES[m], sig = M.sig(g);
+  const key = m + ":" + g.id;
+  let entry = cache.get(key);
   const upToDate = entry && (final
     ? entry.endedAt !== undefined && (entry.settled || now - entry.fetchedAt < FINAL_REFETCH_MS)
     : entry.sig === sig);
 
   if (!upToDate) {
-    const summary = await getJSON(`${API}/summary?event=${g.id}`).catch(() => null);
+    const summary = await getJSON(`${M.api}/summary?event=${g.id}`).catch(() => null);
     if (summary) {
       // endedAt is when this tab first got a box score for the game as final.
       const endedAt = final ? (entry?.endedAt ?? now) : undefined;
-      entry = { players: parsePlayers(summary), sig, fetchedAt: now, endedAt, settled: false };
-      cache.set(g.id, entry);
+      entry = { players: M.parse(summary), sig, fetchedAt: now, endedAt, settled: false };
+      cache.set(key, entry);
     }
   }
 
-  // An empty box score never settles, so a bad response gets retried instead of kept for good.
-  if (final && entry?.endedAt !== undefined && !entry.settled && entry.players.length &&
-      (now - entry.endedAt >= SETTLE_MS || now - g.start >= LONG_AGO_MS)) entry.settled = true;
+  // An empty box score never settles (unless the sport allows it), so a bad response gets
+  // retried instead of kept for good.
+  if (final && entry?.endedAt !== undefined && !entry.settled && (entry.players.length || M.emptyFinal) &&
+      (now - entry.endedAt >= SETTLE_MS || now - g.start >= M.longAgo)) entry.settled = true;
   g.settled = !!(final && entry?.settled);
+  g.missing = !entry; // no box score yet, so an empty list here means "unknown", not "nothing happened"
 
   // Status comes from the scoreboard, so it stays current even if the box score fetch failed.
-  return (entry?.players || []).map(p => ({ ...p, state: g.state, detail: g.detail }));
+  return (entry?.players || []).map(p => ({ ...p, gameId: g.id, state: g.state, detail: g.detail }));
 }
 
 // Timers don't fetch while the tab is hidden; the visibilitychange handler catches up instead.
@@ -202,7 +289,7 @@ function schedule(ms) {
 function tick() {
   const date = $("date").value;
   // Hold the rollover until the previous night's games are over and their stats have settled.
-  const busy = last?.date === date && last.games.some(g => g.state === "in" || (g.state === "post" && !g.settled));
+  const busy = last?.date === date && last.games.filter(g => !excluded.has(g.id)).some(g => g.state === "in" || (g.state === "post" && !g.settled));
   if (followToday && date !== todayET() && !busy) go(todayET());
   else load(date);
 }
@@ -223,75 +310,97 @@ function showError(err, date) {
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 
 function render(date, games, players) {
+  const M = MODES[mode];
   $("updated").textContent = "Last update: " + new Date(lastLoadAt).toLocaleTimeString() +
     (refreshError ? ` (couldn't refresh: ${refreshError}; retrying)` : "");
 
+  // NFL promos run on a slate of games, so each game card toggles whether it's on the slate.
+  const tag = mode === "nfl" ? "button" : "div";
   $("games").innerHTML = games.map(g => `
-    <div class="game ${g.state}">
+    <${tag} class="game ${g.state}${excluded.has(g.id) ? " out" : ""}" data-id="${esc(g.id)}"${tag === "button" ? ` title="${excluded.has(g.id) ? "Add to" : "Remove from"} slate"` : ""}>
       <div class="row"><span>${esc(g.away.team.abbreviation)}</span><span>${g.state === "pre" ? "" : esc(g.away.score)}</span></div>
       <div class="row"><span>${esc(g.home.team.abbreviation)}</span><span>${g.state === "pre" ? "" : esc(g.home.score)}</span></div>
       <div class="st">${g.state === "in" ? '<span class="dot"></span>' : ""}${esc(g.detail)}</div>
-    </div>`).join("");
+    </${tag}>`).join("");
 
-  if (!games.length) {
+  const slate = games.filter(g => !excluded.has(g.id));
+  if (!slate.length) {
     $("king").innerHTML = "";
     $("board").className = "empty";
-    $("board").textContent = "No NBA games on this date.";
+    $("board").textContent = games.length ? "Every game is off the slate. Tap one to add it back." : M.none;
     return;
   }
   if (!players.length) {
     $("king").innerHTML = "";
     $("board").className = "empty";
-    $("board").textContent = games.some(g => g.state !== "pre")
-      ? "Box scores aren't available yet. Retrying shortly."
-      : "No games have tipped off yet.";
+    $("board").textContent = slate.some(g => g.missing) ? "Box scores aren't available yet. Retrying shortly."
+      : slate.some(g => g.state !== "pre") ? M.empty : M.pre;
     return;
   }
 
-  const top = players[0].pra;
-  const kings = players.filter(p => p.pra === top);
+  const top = players[0].value;
+  const kings = [...new Set(players.filter(p => p.value === top).map(p => p.name))];
   // Only crown a king once every game is final and its stats have had time to settle.
-  const allFinal = games.every(g => g.state === "post" && g.settled);
+  const allFinal = slate.every(g => g.state === "post" && g.settled);
   $("king").innerHTML = `<div class="king">${allFinal ? "The king is" : "Current leader:"}
-    <b>${kings.map(p => esc(p.name)).join(" & ")}</b> with <b>${top}</b> PRA</div>`;
+    ${M.king(kings.map(esc).join(" & "), top)}</div>`;
 
-  const hide = $("contenders").checked;
-  const shown = hide ? players.filter(p => p.state !== "post" || p.pra === top) : players;
+  const hide = mode === "nba" && $("contenders").checked;
+  const shown = hide ? players.filter(p => p.state !== "post" || p.value === top) : players;
 
   let rank = 0, prev = null;
   $("board").className = "";
   $("board").innerHTML = `<table>
-    <thead><tr><th>#</th><th>Player</th><th>Team</th><th class="hide-sm">Min</th>
-      <th>Pts</th><th>Reb</th><th>Ast</th><th>PRA</th><th class="hide-sm">Status</th></tr></thead>
+    <thead><tr>${M.head}</tr></thead>
     <tbody>${shown.map((p, i) => {
-      if (p.pra !== prev) { rank = i + 1; prev = p.pra; }
-      const crown = p.pra === top ? " 👑" : "";
-      return `<tr class="${p.pra === top ? "top" : ""}">
-        <td class="rank">${rank}</td>
-        <td>${esc(p.name)}${crown}</td>
-        <td><span class="team"><img src="${esc(p.logo)}" alt="${esc(p.team)}" title="${esc(p.team)}" loading="lazy"><span class="hide-sm">${esc(p.team)}</span></span></td>
-        <td class="hide-sm">${esc(p.min ?? "")}</td>
-        <td>${p.pts}</td><td>${p.reb}</td><td>${p.ast}</td>
-        <td class="pra">${p.pra}</td>
-        <td class="status ${p.state} hide-sm">${p.state === "in" ? '<span class="dot"></span>' : ""}${esc(p.detail)}</td>
+      if (p.value !== prev) { rank = i + 1; prev = p.value; }
+      const crown = p.value === top ? " 👑" : "";
+      return `<tr class="${p.value === top ? "top" : ""}">
+        <td class="rank">${rank}</td>${M.cells(p, crown)}
       </tr>`;
     }).join("")}</tbody></table>`;
 }
 
-function go(date) {
+function go(date, newMode = mode) {
   clearTimeout(timer);
+  if (newMode !== mode || date !== shownDate) { excluded.clear(); last = null; }
+  mode = newMode;
+  shownDate = date;
+  const M = MODES[mode];
+  document.title = M.doc;
+  $("title").textContent = M.title;
+  $("blurb").textContent = M.blurb;
+  $("foot").textContent = M.foot;
+  $("contenders-label").hidden = mode !== "nba";
+  for (const b of document.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", b.dataset.mode === mode);
+  $("games").innerHTML = "";
+  $("king").innerHTML = "";
+
   followToday = date === todayET();
   $("date").value = date;
-  history.replaceState(null, "", followToday ? location.pathname : "#" + date);
+  const prefix = mode === "nfl" ? "#nfl" : "";
+  history.replaceState(null, "", (followToday ? prefix : (prefix ? prefix + "/" : "#") + date) || location.pathname);
   $("board").className = "empty";
   $("board").textContent = "Loading…";
   load(date);
 }
 
 $("date").addEventListener("change", e => e.target.value && go(e.target.value));
+for (const b of document.querySelectorAll(".tabs button"))
+  b.addEventListener("click", () => b.dataset.mode !== mode && go(todayET(), b.dataset.mode));
+$("games").addEventListener("click", e => {
+  const card = e.target.closest("button.game");
+  if (!card) return;
+  const id = card.dataset.id;
+  if (excluded.delete(id)) return load($("date").value); // adding a game back needs its scoring plays
+  excluded.add(id);
+  if (!last) return load($("date").value);
+  last.players = last.players.filter(p => p.gameId !== id);
+  render(last.date, last.games, last.players);
+});
 $("today").addEventListener("click", () => go(todayET()));
 $("contenders").addEventListener("change", () => last && render(last.date, last.games, last.players));
-window.addEventListener("hashchange", () => go(readHash()));
+window.addEventListener("hashchange", () => { const h = readHash(); go(h.date, h.mode); });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   // Catch up after a skipped poll, or after the phone froze timers while we were following today.
@@ -301,7 +410,7 @@ document.addEventListener("visibilitychange", () => {
     tick();
   }
 });
-go(readHash());
+{ const h = readHash(); go(h.date, h.mode); }
 </script>
 </body>
 </html>
